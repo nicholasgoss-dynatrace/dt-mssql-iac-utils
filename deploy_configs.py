@@ -12,6 +12,12 @@ Usage:
     python deploy_configs.py --env-url https://your-env.live.dynatrace.com \
         --api-token YOUR_API_TOKEN
 
+    Target a specific ActiveGate group (overrides scope in all config files):
+        python deploy_configs.py --scope ag_group-XXXXXXXXXXXXXXXX
+
+    List ActiveGate groups to find the right scope ID:
+        python deploy_configs.py --list-ag-groups
+
     With a custom configs directory:
         python deploy_configs.py --configs-dir ./my-configs/
 
@@ -24,6 +30,7 @@ Usage:
 Environment variables:
     DT_ENV_URL      Dynatrace environment URL
     DT_API_TOKEN    API token with extensions.write + credentialVault.read scopes
+    DT_AG_SCOPE     ActiveGate group scope (e.g. ag_group-XXXXXXXXXXXXXXXX)
 """
 
 import argparse
@@ -50,12 +57,18 @@ def parse_args():
                         help="Directory containing JSON monitoring config files (default: configs/)")
     parser.add_argument("--config-file", default=None,
                         help="Deploy a single specific config file")
+    parser.add_argument("--scope", default=os.environ.get("DT_AG_SCOPE"),
+                        help="Override scope for all deployed configs. Use 'environment' or an "
+                             "ActiveGate group ID (ag_group-XXXXXXXXXXXXXXXX). "
+                             "If omitted, the scope in each config file is used.")
     parser.add_argument("--update", metavar="CONFIG_ID", default=None,
                         help="Update an existing monitoring config by ID (requires --config-file)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate and print payloads without sending")
     parser.add_argument("--list", action="store_true",
                         help="List existing monitoring configurations and exit")
+    parser.add_argument("--list-ag-groups", action="store_true",
+                        help="List ActiveGate groups and their scope IDs, then exit")
     return parser.parse_args()
 
 
@@ -87,14 +100,69 @@ def list_configs(env_url: str, api_token: str):
     if not items:
         print("No monitoring configurations found.")
         return
-    print(f"{'ID':<40} {'Description'}")
-    print("-" * 80)
+    print(f"{'ID':<40} {'Scope':<30} {'Description'}")
+    print("-" * 100)
     for item in items:
-        print(f"{item.get('objectId', ''):<40} {item.get('description', '')}")
+        print(f"{item.get('objectId', ''):<40} {item.get('scope', ''):<30} {item.get('description', '')}")
 
 
-def deploy_config(env_url: str, api_token: str, payload: dict,
-                  config_file: str, update_id: str, dry_run: bool):
+def list_ag_groups(env_url: str, api_token: str):
+    url = f"{env_url}/api/v2/activeGates?groupBy=group"
+    result = api_request("GET", url, api_token)
+    gates = result.get("activeGates", [])
+
+    # Collect unique groups across all ActiveGates
+    groups = {}
+    for gate in gates:
+        group = gate.get("group")
+        if group:
+            # The scope ID format is ag_group-<entityId of the group>
+            group_id = gate.get("autoUpdateSettings", {})
+            # Group entity IDs are surfaced on the gate itself in some API versions
+            group_entity = gate.get("groupId") or gate.get("group")
+            if group not in groups:
+                groups[group] = []
+            groups[group].append(gate.get("id", ""))
+
+    if not groups:
+        print("No ActiveGate groups found (or no ActiveGates with group assignments).")
+        print()
+        print("Tip: run with activeGates.read scope to see group details.")
+        print("     ActiveGate group scope IDs have the format: ag_group-XXXXXXXXXXXXXXXX")
+        print("     Find them in Settings → ActiveGates → Groups in the Dynatrace UI.")
+        return
+
+    # Also try the dedicated groups endpoint if available
+    try:
+        groups_url = f"{env_url}/api/v2/activeGateGroups"
+        groups_result = api_request("GET", groups_url, api_token)
+        group_items = groups_result.get("groups", groups_result.get("items", []))
+        if group_items:
+            print(f"{'Scope ID (use with --scope)':<45} {'Group Name'}")
+            print("-" * 80)
+            for g in group_items:
+                entity_id = g.get("id", g.get("entityId", ""))
+                name = g.get("name", g.get("groupName", ""))
+                scope_id = f"ag_group-{entity_id}" if not entity_id.startswith("ag_group-") else entity_id
+                print(f"{scope_id:<45} {name}")
+            return
+    except RuntimeError:
+        pass
+
+    print(f"{'Group Name':<40} {'ActiveGate IDs'}")
+    print("-" * 80)
+    for name, gate_ids in sorted(groups.items()):
+        print(f"{name:<40} {', '.join(gate_ids[:3])}{'...' if len(gate_ids) > 3 else ''}")
+    print()
+    print("Tip: to get the ag_group-XXXX scope IDs, go to Settings → ActiveGates → Groups")
+    print("     in the Dynatrace UI and copy the entity ID from the URL.")
+
+
+def deploy_config(env_url: str, api_token: str, payload: dict, config_file: str,
+                  scope_override: str, update_id: str, dry_run: bool):
+    if scope_override:
+        payload = {**payload, "scope": scope_override}
+
     if update_id:
         url = f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations/{update_id}"
         method = "PUT"
@@ -104,7 +172,8 @@ def deploy_config(env_url: str, api_token: str, payload: dict,
 
     if dry_run:
         print(f"[DRY RUN] {method} {url}")
-        print(f"  File   : {config_file}")
+        print(f"  File     : {config_file}")
+        print(f"  Scope    : {payload.get('scope', '(from file)')}")
         endpoints = payload.get("value", {}).get("endpoints", [])
         print(f"  Endpoints: {len(endpoints)}")
         return None
@@ -129,6 +198,13 @@ def main():
 
     env_url = (args.env_url or "").rstrip("/")
     api_token = args.api_token
+
+    if args.list_ag_groups:
+        if not env_url or not api_token:
+            print("--env-url and --api-token are required", file=sys.stderr)
+            sys.exit(1)
+        list_ag_groups(env_url, api_token)
+        return
 
     if args.list:
         if not env_url or not api_token:
@@ -158,6 +234,9 @@ def main():
             print(f"No JSON files found in {configs_dir}", file=sys.stderr)
             sys.exit(1)
 
+    if args.scope:
+        print(f"Scope override: {args.scope}")
+
     errors = []
     deployed = []
 
@@ -169,6 +248,7 @@ def main():
                 api_token=api_token,
                 payload=payload,
                 config_file=str(config_file),
+                scope_override=args.scope,
                 update_id=args.update if args.config_file else None,
                 dry_run=args.dry_run,
             )

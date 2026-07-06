@@ -125,6 +125,75 @@ configs/
 
 Each file is independent. Different files can reference different credentials — useful if different environments use different SQL service accounts.
 
+## Targeting a specific ActiveGate group
+
+By default, `"scope": "environment"` means any available ActiveGate can run the extension. To pin monitoring to a specific ActiveGate group (e.g. a DMZ group for on-prem servers):
+
+### Step 1 — Find the ActiveGate group ID
+
+```bash
+python deploy_configs.py --list-ag-groups
+```
+
+Output:
+
+```
+Scope ID (use with --scope)                   Group Name
+--------------------------------------------------------------------------------
+ag_group-XXXXXXXXXXXXXXXX                     prod-dmz-ag-group
+ag_group-YYYYYYYYYYYYYYYY                     nonprod-ag-group
+```
+
+If the API doesn't expose a dedicated groups endpoint, the script will guide you to find the IDs in the Dynatrace UI under **Settings → ActiveGates → Groups**.
+
+### Step 2a — Set scope per config file
+
+Edit the `scope` field directly in your JSON file to pin that configuration permanently:
+
+```json
+{
+  "scope": "ag_group-XXXXXXXXXXXXXXXX",
+  "description": "Prod East MSSQL — routed through DMZ ActiveGate group",
+  ...
+}
+```
+
+Use this approach when different config files need different AG groups.
+
+### Step 2b — Override scope at deploy time
+
+Use `--scope` to override the scope for all files in a single run — useful in pipelines where the target group varies by environment:
+
+```bash
+python deploy_configs.py --scope ag_group-XXXXXXXXXXXXXXXX
+```
+
+Or set it via env var:
+
+```bash
+export DT_AG_SCOPE=ag_group-XXXXXXXXXXXXXXXX
+python deploy_configs.py
+```
+
+`--scope` always wins over whatever is in the JSON file, so the same `configs/` folder can be reused across environments with no file edits.
+
+### Dry run with scope override
+
+```bash
+python deploy_configs.py --scope ag_group-XXXXXXXXXXXXXXXX --dry-run
+```
+
+Output:
+
+```
+Scope override: ag_group-XXXXXXXXXXXXXXXX
+
+[DRY RUN] POST https://abc123.live.dynatrace.com/api/v2/extensions/com.dynatrace.extension.sql-server/monitoringConfigurations
+  File     : configs/prod-east.json
+  Scope    : ag_group-XXXXXXXXXXXXXXXX
+  Endpoints: 3
+```
+
 ## Options reference
 
 | Flag | Env var | Description |
@@ -133,9 +202,11 @@ Each file is independent. Different files can reference different credentials �
 | `--api-token` | `DT_API_TOKEN` | API token |
 | `--configs-dir` | — | Path to configs folder (default: `configs/`) |
 | `--config-file` | — | Deploy a single file |
+| `--scope` | `DT_AG_SCOPE` | Override scope (e.g. `ag_group-XXXX` or `environment`) |
 | `--update <id>` | — | PUT to an existing config ID (requires `--config-file`) |
 | `--dry-run` | — | Validate files without making API calls |
 | `--list` | — | Print existing monitoring config IDs and exit |
+| `--list-ag-groups` | — | Print ActiveGate groups and scope IDs, then exit |
 
 ## CI/CD integration
 
@@ -147,7 +218,8 @@ The scripts are self-contained Python with no dependencies. To integrate into a 
   env:
     DT_ENV_URL: ${{ secrets.DT_ENV_URL }}
     DT_API_TOKEN: ${{ secrets.DT_API_TOKEN }}
+    DT_AG_SCOPE: ${{ secrets.DT_AG_SCOPE }}   # optional: pin to an AG group
   run: python deploy_configs.py
 ```
 
-Store `DT_ENV_URL` and `DT_API_TOKEN` as pipeline secrets — never in the repo.
+Store `DT_ENV_URL`, `DT_API_TOKEN`, and `DT_AG_SCOPE` as pipeline secrets — never in the repo.
