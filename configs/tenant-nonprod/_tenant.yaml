@@ -1,0 +1,2 @@
+env_url: "https://nonprod-tenant.live.dynatrace.com"
+token_env: "DT_API_TOKEN_NONPROD"

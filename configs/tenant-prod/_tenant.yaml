@@ -1,0 +1,8 @@
+# Dynatrace tenant configuration — DO NOT store tokens here.
+# The token is read at runtime from the environment variable named in token_env.
+
+env_url: "https://prod-tenant.live.dynatrace.com"
+
+# Name of the environment variable that holds this tenant's API token.
+# Required scopes: extensions.write, extensions.read, credentialVault.read
+token_env: "DT_API_TOKEN_PROD"

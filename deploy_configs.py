@@ -2,29 +2,36 @@
 """
 Deploy MSSQL monitoring configurations to Dynatrace Extensions 2.0.
 
-Reads individual endpoint YAML (or JSON) files from a configs/ directory,
-groups them by their `ag_group` field, and POSTs one monitoring configuration
-per unique group to com.dynatrace.extension.sql-server.
+Walks a three-level configs/ hierarchy:
+  configs/
+    <tenant>/
+      _tenant.yaml          ← env_url, token_env
+      <ag-group>/
+        _group.yaml         ← scope (ag_group-XXXX), description
+        sql-server-01.yaml  ← one file per SQL Server endpoint
+        sql-server-02.yaml
 
-Each endpoint file is the IaC record for a single SQL Server instance.
-The compiler handles batching — you never hand-edit the payload sent to Dynatrace.
+For each tenant, resolves credentials from the environment variable named in
+_tenant.yaml, then deploys one monitoring configuration per AG group folder.
 
 Usage:
-    python deploy_configs.py --env-url https://your-env.live.dynatrace.com \
-        --api-token YOUR_API_TOKEN
+    python deploy_configs.py
 
-    Dry run (compile and print groups without sending):
+    Dry run (compile and print without deploying):
         python deploy_configs.py --dry-run
 
-    List existing monitoring configurations:
-        python deploy_configs.py --list
+    Single tenant only:
+        python deploy_configs.py --tenant prod
 
-    List ActiveGate groups to find scope IDs:
-        python deploy_configs.py --list-ag-groups
+    List existing monitoring configurations for a tenant:
+        python deploy_configs.py --list --tenant prod
+
+    List ActiveGate groups for a tenant:
+        python deploy_configs.py --list-ag-groups --tenant prod
 
 Environment variables:
-    DT_ENV_URL      Dynatrace environment URL
-    DT_API_TOKEN    API token with extensions.write + credentialVault.read scopes
+    Per-tenant API tokens are resolved from the variable named in each
+    _tenant.yaml token_env field (e.g. DT_API_TOKEN_PROD, DT_API_TOKEN_NONPROD).
 """
 
 import argparse
@@ -43,27 +50,176 @@ except ImportError:
 
 
 EXTENSION_NAME = "com.dynatrace.extension.sql-server"
-DEFAULT_SCOPE = "environment"
+TENANT_MANIFEST = "_tenant.yaml"
+GROUP_MANIFEST = "_group.yaml"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Compile endpoint YAML files and deploy MSSQL monitoring configs to Dynatrace"
     )
-    parser.add_argument("--env-url", default=os.environ.get("DT_ENV_URL"),
-                        help="Dynatrace environment URL")
-    parser.add_argument("--api-token", default=os.environ.get("DT_API_TOKEN"),
-                        help="Dynatrace API token (extensions.write + credentialVault.read)")
     parser.add_argument("--configs-dir", default="configs",
-                        help="Directory containing endpoint YAML/JSON files (default: configs/)")
+                        help="Root configs directory (default: configs/)")
+    parser.add_argument("--tenant", default=None,
+                        help="Deploy only this tenant folder (default: all tenants)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compile and print grouped payloads without deploying")
     parser.add_argument("--list", action="store_true",
-                        help="List existing monitoring configurations and exit")
+                        help="List existing monitoring configurations for the tenant(s)")
     parser.add_argument("--list-ag-groups", action="store_true",
-                        help="List ActiveGate groups and their scope IDs, then exit")
+                        help="List ActiveGate groups and scope IDs for the tenant(s)")
     return parser.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# File loading
+# ---------------------------------------------------------------------------
+
+def load_yaml_or_json(path: Path) -> dict:
+    if not HAS_YAML:
+        raise RuntimeError("PyYAML is required. Run: pip install -r requirements.txt")
+    with open(path) as f:
+        suffix = path.suffix.lower()
+        if suffix in (".yaml", ".yml"):
+            return yaml.safe_load(f) or {}
+        return json.load(f)
+
+
+def load_tenant_manifest(tenant_dir: Path) -> dict:
+    manifest_path = tenant_dir / TENANT_MANIFEST
+    if not manifest_path.exists():
+        raise RuntimeError(f"Missing {TENANT_MANIFEST} in {tenant_dir}")
+    data = load_yaml_or_json(manifest_path)
+    if not data.get("env_url"):
+        raise RuntimeError(f"Missing 'env_url' in {manifest_path}")
+    if not data.get("token_env"):
+        raise RuntimeError(f"Missing 'token_env' in {manifest_path}")
+    return data
+
+
+def load_group_manifest(group_dir: Path) -> dict:
+    manifest_path = group_dir / GROUP_MANIFEST
+    if not manifest_path.exists():
+        raise RuntimeError(f"Missing {GROUP_MANIFEST} in {group_dir}")
+    data = load_yaml_or_json(manifest_path)
+    if not data.get("scope"):
+        raise RuntimeError(f"Missing 'scope' in {manifest_path}")
+    return data
+
+
+def endpoint_to_api_shape(data: dict, source_file: str) -> dict:
+    name = data.get("name")
+    if not name:
+        raise ValueError(f"Missing required field 'name' in {source_file}")
+    connection_string = data.get("connection_string") or data.get("connectionString")
+    if not connection_string:
+        raise ValueError(f"Missing required field 'connection_string' in {source_file}")
+    credential_id = data.get("credential_id") or data.get("credentialId")
+    if not credential_id:
+        raise ValueError(f"Missing required field 'credential_id' in {source_file}")
+    return {
+        "name": name,
+        "enabled": data.get("enabled", True),
+        "connectionString": connection_string,
+        "authentication": {
+            "scheme": data.get("auth_scheme", "sqlAuth"),
+            "credentials": credential_id,
+        },
+        "sqlServerLogsEnabled": data.get("sql_server_logs_enabled", False),
+        "queries": data.get("queries", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Compilation
+# ---------------------------------------------------------------------------
+
+def compile_tenant(tenant_dir: Path) -> dict:
+    """
+    Returns:
+      {
+        "env_url": str,
+        "api_token": str,
+        "groups": {
+          scope_id: { "description": str, "endpoints": [...], "source_files": [...] }
+        }
+      }
+    """
+    tenant_manifest = load_tenant_manifest(tenant_dir)
+    env_url = tenant_manifest["env_url"].rstrip("/")
+    token_env = tenant_manifest["token_env"]
+    api_token = os.environ.get(token_env)
+    if not api_token:
+        raise RuntimeError(
+            f"Tenant '{tenant_dir.name}': env var '{token_env}' is not set. "
+            f"Export it before running: export {token_env}=<your-api-token>"
+        )
+
+    groups = {}
+    errors = []
+
+    group_dirs = sorted(p for p in tenant_dir.iterdir() if p.is_dir())
+    if not group_dirs:
+        raise RuntimeError(f"No AG group subdirectories found in {tenant_dir}")
+
+    for group_dir in group_dirs:
+        try:
+            group_manifest = load_group_manifest(group_dir)
+        except RuntimeError as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            errors.append(str(group_dir))
+            continue
+
+        scope = group_manifest["scope"]
+        description = group_manifest.get(
+            "description",
+            f"Managed by dt-mssql-iac-utils — {tenant_dir.name}/{group_dir.name}"
+        )
+
+        endpoint_files = sorted(
+            f for f in group_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in (".yaml", ".yml", ".json")
+            and f.name != GROUP_MANIFEST
+        )
+        if not endpoint_files:
+            print(f"  WARNING: no endpoint files in {group_dir}, skipping.", file=sys.stderr)
+            continue
+
+        endpoints = []
+        for ep_file in endpoint_files:
+            try:
+                data = load_yaml_or_json(ep_file)
+                endpoints.append(endpoint_to_api_shape(data, ep_file.name))
+            except (ValueError, RuntimeError) as e:
+                print(f"  ERROR loading {ep_file}: {e}", file=sys.stderr)
+                errors.append(str(ep_file))
+
+        if scope not in groups:
+            groups[scope] = {"description": description, "endpoints": [], "source_files": []}
+        groups[scope]["endpoints"].extend(endpoints)
+        groups[scope]["source_files"].extend(f.name for f in endpoint_files)
+
+    if errors:
+        raise RuntimeError(f"{len(errors)} file error(s) in {tenant_dir.name} — see above")
+
+    return {"env_url": env_url, "api_token": api_token, "groups": groups}
+
+
+def discover_tenants(configs_dir: Path, tenant_filter: str = None) -> list[Path]:
+    if tenant_filter:
+        path = configs_dir / tenant_filter
+        if not path.is_dir():
+            raise RuntimeError(f"Tenant directory not found: {path}")
+        return [path]
+    tenants = sorted(p for p in configs_dir.iterdir() if p.is_dir())
+    if not tenants:
+        raise RuntimeError(f"No tenant directories found in {configs_dir}")
+    return tenants
+
+
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
 
 def api_request(method: str, url: str, api_token: str, payload: dict = None) -> dict:
     body = json.dumps(payload).encode("utf-8") if payload else None
@@ -86,95 +242,7 @@ def api_request(method: str, url: str, api_token: str, payload: dict = None) -> 
         raise RuntimeError(f"HTTP {e.code} {method} {url}: {body}")
 
 
-def load_endpoint_file(path: Path) -> dict:
-    """Load a single endpoint YAML or JSON file."""
-    suffix = path.suffix.lower()
-    with open(path) as f:
-        if suffix in (".yaml", ".yml"):
-            if not HAS_YAML:
-                raise RuntimeError(
-                    f"PyYAML is required to read {path.name}. Run: pip install pyyaml"
-                )
-            return yaml.safe_load(f)
-        elif suffix == ".json":
-            return json.load(f)
-        else:
-            raise ValueError(f"Unsupported file type: {path.name} (use .yaml, .yml, or .json)")
-
-
-def endpoint_file_to_api_shape(data: dict, source_file: str) -> dict:
-    """Convert a flat endpoint YAML into the shape the extension API expects."""
-    name = data.get("name")
-    if not name:
-        raise ValueError(f"Missing required field 'name' in {source_file}")
-
-    connection_string = data.get("connection_string") or data.get("connectionString")
-    if not connection_string:
-        raise ValueError(f"Missing required field 'connection_string' in {source_file}")
-
-    credential_id = data.get("credential_id") or data.get("credentialId")
-    if not credential_id:
-        raise ValueError(f"Missing required field 'credential_id' in {source_file}")
-
-    return {
-        "name": name,
-        "enabled": data.get("enabled", True),
-        "connectionString": connection_string,
-        "authentication": {
-            "scheme": data.get("auth_scheme", "sqlAuth"),
-            "credentials": credential_id,
-        },
-        "sqlServerLogsEnabled": data.get("sql_server_logs_enabled", False),
-        "queries": data.get("queries", []),
-    }
-
-
-def compile_endpoint_files(configs_dir: Path) -> dict:
-    """
-    Read all endpoint files, group by ag_group, return:
-      { scope: { "description": str, "endpoints": [api_shape, ...] } }
-    """
-    patterns = ["*.yaml", "*.yml", "*.json"]
-    files = []
-    for pattern in patterns:
-        files.extend(configs_dir.glob(pattern))
-    files = sorted(set(files))
-
-    if not files:
-        raise RuntimeError(f"No endpoint files found in {configs_dir}")
-
-    groups: dict[str, dict] = {}
-    errors = []
-
-    for path in files:
-        try:
-            data = load_endpoint_file(path)
-            scope = data.get("ag_group") or data.get("scope") or DEFAULT_SCOPE
-            endpoint = endpoint_file_to_api_shape(data, path.name)
-
-            if scope not in groups:
-                groups[scope] = {
-                    "description": data.get(
-                        "group_description",
-                        f"Managed by dt-mssql-iac-utils — scope: {scope}"
-                    ),
-                    "endpoints": [],
-                    "source_files": [],
-                }
-            groups[scope]["endpoints"].append(endpoint)
-            groups[scope]["source_files"].append(path.name)
-
-        except (ValueError, RuntimeError, KeyError) as e:
-            print(f"ERROR loading {path.name}: {e}", file=sys.stderr)
-            errors.append(path.name)
-
-    if errors:
-        sys.exit(1)
-
-    return groups
-
-
-def build_monitoring_config_payload(scope: str, group_data: dict) -> dict:
+def build_payload(scope: str, group_data: dict) -> dict:
     return {
         "scope": scope,
         "description": group_data["description"],
@@ -191,128 +259,147 @@ def list_configs(env_url: str, api_token: str):
     result = api_request("GET", url, api_token)
     items = result.get("items", [])
     if not items:
-        print("No monitoring configurations found.")
+        print("  No monitoring configurations found.")
         return
-    print(f"{'ID':<40} {'Scope':<30} {'Description'}")
-    print("-" * 100)
+    print(f"  {'ID':<40} {'Scope':<30} {'Description'}")
+    print("  " + "-" * 96)
     for item in items:
-        print(f"{item.get('objectId', ''):<40} {item.get('scope', ''):<30} {item.get('description', '')}")
+        print(f"  {item.get('objectId', ''):<40} {item.get('scope', ''):<30} {item.get('description', '')}")
 
 
 def list_ag_groups(env_url: str, api_token: str):
     try:
-        groups_url = f"{env_url}/api/v2/activeGateGroups"
-        result = api_request("GET", groups_url, api_token)
-        group_items = result.get("groups", result.get("items", []))
-        if group_items:
-            print(f"{'Scope ID (use as ag_group in endpoint files)':<48} {'Group Name'}")
-            print("-" * 80)
-            for g in group_items:
-                entity_id = g.get("id", g.get("entityId", ""))
-                name = g.get("name", g.get("groupName", ""))
-                scope_id = entity_id if entity_id.startswith("ag_group-") else f"ag_group-{entity_id}"
-                print(f"{scope_id:<48} {name}")
+        result = api_request("GET", f"{env_url}/api/v2/activeGateGroups", api_token)
+        items = result.get("groups", result.get("items", []))
+        if items:
+            print(f"  {'Scope ID':<48} {'Group Name'}")
+            print("  " + "-" * 76)
+            for g in items:
+                eid = g.get("id", g.get("entityId", ""))
+                scope_id = eid if eid.startswith("ag_group-") else f"ag_group-{eid}"
+                print(f"  {scope_id:<48} {g.get('name', g.get('groupName', ''))}")
             return
     except RuntimeError:
         pass
 
-    # Fallback: derive groups from activeGates list
-    url = f"{env_url}/api/v2/activeGates"
-    result = api_request("GET", url, api_token)
-    gates = result.get("activeGates", [])
-    groups = {}
-    for gate in gates:
-        group = gate.get("group")
-        if group:
-            groups.setdefault(group, []).append(gate.get("id", ""))
-
-    if not groups:
-        print("No ActiveGate groups found.")
-        print("Find group scope IDs in the Dynatrace UI: Settings → ActiveGates → Groups")
+    result = api_request("GET", f"{env_url}/api/v2/activeGates", api_token)
+    seen = {}
+    for gate in result.get("activeGates", []):
+        grp = gate.get("group")
+        if grp:
+            seen.setdefault(grp, []).append(gate.get("id", ""))
+    if not seen:
+        print("  No ActiveGate groups found. Check Settings → ActiveGates → Groups in the UI.")
         return
-
-    print(f"{'Group Name':<40} {'ActiveGate IDs (sample)'}")
-    print("-" * 80)
-    for name, gate_ids in sorted(groups.items()):
-        sample = ", ".join(gate_ids[:3]) + ("..." if len(gate_ids) > 3 else "")
-        print(f"{name:<40} {sample}")
+    print(f"  {'Group Name':<40} {'ActiveGate IDs (sample)'}")
+    print("  " + "-" * 76)
+    for name, ids in sorted(seen.items()):
+        print(f"  {name:<40} {', '.join(ids[:3])}{'...' if len(ids) > 3 else ''}")
     print()
-    print("Tip: Get ag_group-XXXX scope IDs from Settings → ActiveGates → Groups in the UI.")
+    print("  Tip: get ag_group-XXXX scope IDs from Settings → ActiveGates → Groups in the UI.")
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
-
-    env_url = (args.env_url or "").rstrip("/")
-    api_token = args.api_token
-
-    if args.list_ag_groups:
-        if not env_url or not api_token:
-            print("--env-url and --api-token are required", file=sys.stderr)
-            sys.exit(1)
-        list_ag_groups(env_url, api_token)
-        return
-
-    if args.list:
-        if not env_url or not api_token:
-            print("--env-url and --api-token are required", file=sys.stderr)
-            sys.exit(1)
-        list_configs(env_url, api_token)
-        return
-
-    if not args.dry_run:
-        missing = [f for f, v in [
-            ("--env-url / DT_ENV_URL", env_url),
-            ("--api-token / DT_API_TOKEN", api_token),
-        ] if not v]
-        if missing:
-            print("Missing required values:", ", ".join(missing), file=sys.stderr)
-            sys.exit(1)
-
     configs_dir = Path(args.configs_dir)
+
     if not configs_dir.exists():
         print(f"Configs directory not found: {configs_dir}", file=sys.stderr)
         sys.exit(1)
 
-    groups = compile_endpoint_files(configs_dir)
+    try:
+        tenant_dirs = discover_tenants(configs_dir, args.tenant)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Compiled {sum(len(g['endpoints']) for g in groups.values())} endpoint(s) "
-          f"into {len(groups)} monitoring configuration(s):\n")
+    # --list / --list-ag-groups: just need tenant manifests, not full compile
+    if args.list or args.list_ag_groups:
+        for tenant_dir in tenant_dirs:
+            print(f"\nTenant: {tenant_dir.name}")
+            try:
+                manifest = load_tenant_manifest(tenant_dir)
+                token = os.environ.get(manifest["token_env"])
+                if not token:
+                    print(f"  ERROR: env var '{manifest['token_env']}' is not set", file=sys.stderr)
+                    continue
+                if args.list:
+                    list_configs(manifest["env_url"].rstrip("/"), token)
+                else:
+                    list_ag_groups(manifest["env_url"].rstrip("/"), token)
+            except RuntimeError as e:
+                print(f"  ERROR: {e}", file=sys.stderr)
+        return
 
-    errors = []
-    deployed = []
-
-    for scope, group_data in groups.items():
-        payload = build_monitoring_config_payload(scope, group_data)
-        endpoint_count = len(group_data["endpoints"])
-        source_files = group_data["source_files"]
-
-        if args.dry_run:
-            print(f"[DRY RUN] scope: {scope}")
-            print(f"  Endpoints : {endpoint_count} ({', '.join(source_files)})")
-            print(f"  Description: {group_data['description']}")
-            print()
-            continue
-
-        url = f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations"
-        print(f"Deploying scope={scope} ({endpoint_count} endpoints) ... ", end="", flush=True)
+    # Compile all tenants first so errors surface before any deploy
+    compiled = {}
+    compile_errors = []
+    for tenant_dir in tenant_dirs:
+        print(f"Compiling {tenant_dir.name} ...", end=" ", flush=True)
         try:
-            result = api_request("POST", url, api_token, payload)
-            config_id = result.get("objectId", result.get("id", "unknown"))
-            print(f"OK  (id: {config_id})")
-            deployed.append((scope, config_id))
+            compiled[tenant_dir.name] = compile_tenant(tenant_dir)
+            total_endpoints = sum(len(g["endpoints"]) for g in compiled[tenant_dir.name]["groups"].values())
+            total_groups = len(compiled[tenant_dir.name]["groups"])
+            print(f"{total_endpoints} endpoint(s) across {total_groups} AG group(s)")
         except RuntimeError as e:
             print(f"FAILED")
-            print(f"  {e}", file=sys.stderr)
-            errors.append(scope)
+            print(f"  ERROR: {e}", file=sys.stderr)
+            compile_errors.append(tenant_dir.name)
+
+    if compile_errors:
+        print(f"\nAborting — compilation failed for: {', '.join(compile_errors)}", file=sys.stderr)
+        sys.exit(1)
 
     print()
-    if args.dry_run:
-        print(f"Dry run complete. {len(groups)} monitoring config(s) would be deployed.")
-    else:
-        print(f"Done. {len(deployed)} deployed, {len(errors)} failed.")
 
-    if errors:
+    total_deployed = 0
+    total_failed = 0
+
+    for tenant_name, tenant_data in compiled.items():
+        env_url = tenant_data["env_url"]
+        api_token = tenant_data["api_token"]
+
+        print(f"Tenant: {tenant_name}  ({env_url})")
+
+        for scope, group_data in tenant_data["groups"].items():
+            endpoint_count = len(group_data["endpoints"])
+            label = f"  scope={scope} ({endpoint_count} endpoints)"
+
+            if args.dry_run:
+                print(f"  [DRY RUN] {label}")
+                print(f"    Description : {group_data['description']}")
+                print(f"    Files       : {', '.join(group_data['source_files'])}")
+                continue
+
+            print(f"  Deploying {label} ... ", end="", flush=True)
+            try:
+                result = api_request(
+                    "POST",
+                    f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations",
+                    api_token,
+                    build_payload(scope, group_data),
+                )
+                config_id = result.get("objectId", result.get("id", "unknown"))
+                print(f"OK  (id: {config_id})")
+                total_deployed += 1
+            except RuntimeError as e:
+                print("FAILED")
+                print(f"    {e}", file=sys.stderr)
+                total_failed += 1
+
+        print()
+
+    if args.dry_run:
+        total_groups = sum(len(t["groups"]) for t in compiled.values())
+        print(f"Dry run complete. {total_groups} monitoring config(s) across {len(compiled)} tenant(s) would be deployed.")
+    else:
+        print(f"Done. {total_deployed} deployed, {total_failed} failed.")
+
+    if total_failed:
         sys.exit(1)
 
 

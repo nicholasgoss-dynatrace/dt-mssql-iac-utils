@@ -1,7 +1,6 @@
 name: prod-sql-east-02
 enabled: true
 connection_string: "Server=prod-sql-east-02.corp.example.com;Port=1433;Database=master;"
-credential_id: "CREDENTIALS_VAULT-<YOUR_CREDENTIAL_ID>"
-ag_group: "ag_group-XXXXXXXXXXXXXXXX"
+credential_id: "CREDENTIALS_VAULT-<YOUR_PROD_CREDENTIAL_ID>"
 sql_server_logs_enabled: false
 queries: []

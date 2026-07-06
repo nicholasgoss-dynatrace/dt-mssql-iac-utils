@@ -1,0 +1,8 @@
+# ActiveGate group configuration for this folder.
+# All endpoint files in this directory are compiled into one monitoring configuration
+# targeting this scope.
+
+# ActiveGate group scope ID — find with: python deploy_configs.py --list-ag-groups --tenant tenant-prod
+scope: "ag_group-XXXXXXXXXXXXXXXX"
+
+description: "Production MSSQL — DMZ ActiveGate group"
