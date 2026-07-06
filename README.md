@@ -6,6 +6,7 @@ Infrastructure-as-code utilities for deploying Microsoft SQL Server monitoring c
 
 | Script | Purpose |
 |---|---|
+| [`bootstrap_configs.py`](bootstrap_configs.py) | Exports existing Dynatrace MSSQL configurations into the IaC folder structure |
 | [`create_credential.py`](create_credential.py) | Creates a SQL Server username/password credential in the Dynatrace Credential Vault |
 | [`deploy_configs.py`](deploy_configs.py) | Compiles endpoint YAML files and deploys monitoring configurations to Dynatrace |
 | [`configs/`](configs/) | Config-as-code store — one YAML file per SQL Server endpoint, organized by tenant and AG group |
@@ -32,19 +33,19 @@ configs/
 
 ## Quick start
 
+### Starting from scratch
+
 ```bash
-# 1. Clone
+# 1. Clone and install
 git clone https://github.com/nicholasgoss-dynatrace/dt-mssql-iac-utils
 cd dt-mssql-iac-utils
-
-# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Set up environment (copy template, fill in values — never commit .env)
+# 2. Set up environment (copy template, fill in values — never commit .env)
 cp .env.template .env
 # edit .env — add API tokens per tenant
 
-# 4. Create a Credential Vault entry for your SQL Server service account
+# 3. Create a Credential Vault entry for your SQL Server service account
 source .env
 python create_credential.py \
     --env-url https://prod-tenant.live.dynatrace.com \
@@ -52,13 +53,32 @@ python create_credential.py \
     --name "mssql-prod-svc"
 # → prints CREDENTIALS_VAULT-XXXX — paste into endpoint YAML files
 
-# 5. Add your endpoint files under configs/<tenant>/<ag-group>/
-# 6. Dry run to validate
+# 4. Add endpoint files under configs/<tenant>/<ag-group>/
+# 5. Dry run, then deploy
 python deploy_configs.py --dry-run
-
-# 7. Deploy
 python deploy_configs.py
 ```
+
+### Already have configs deployed in Dynatrace?
+
+Bootstrap your IaC state from the existing deployment:
+
+```bash
+python bootstrap_configs.py \
+    --env-url https://prod-tenant.live.dynatrace.com \
+    --api-token "$DT_API_TOKEN_PROD" \
+    --tenant-name tenant-prod \
+    --dry-run   # preview first
+
+python bootstrap_configs.py \
+    --env-url https://prod-tenant.live.dynatrace.com \
+    --api-token "$DT_API_TOKEN_PROD" \
+    --tenant-name tenant-prod
+# → generates configs/tenant-prod/ with all your existing endpoints as YAML files
+```
+
+Existing `CREDENTIALS_VAULT-XXXX` IDs are preserved — no passwords needed.
+
 
 ## How it works
 
@@ -82,6 +102,7 @@ The script resolves each tenant's API token from the env var named in `_tenant.y
 
 ## How-to guides
 
+- [How to bootstrap from an existing deployment](docs/how-to-bootstrap.md)
 - [How to create credentials](docs/how-to-create-credentials.md)
 - [How to deploy monitoring configurations](docs/how-to-deploy-configs.md)
 
