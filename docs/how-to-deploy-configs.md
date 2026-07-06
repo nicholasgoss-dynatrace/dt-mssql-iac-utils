@@ -112,28 +112,28 @@ Full field reference:
 
 ## Step 4 — Dry run
 
+Before deploying, always dry-run to see exactly what actions will be taken:
+
 ```bash
 source .env
 python deploy_configs.py --dry-run
 ```
 
-Output:
+Output (first run — nothing deployed yet):
 
 ```
 Compiling tenant-prod ... 2 endpoint(s) across 1 AG group(s)
 Compiling tenant-nonprod ... 2 endpoint(s) across 1 AG group(s)
 
 Tenant: tenant-prod  (https://abc12345.live.dynatrace.com)
-  [DRY RUN] scope=ag_group-XXXXXXXXXXXXXXXX (2 endpoints)
-    Description : Production MSSQL — DMZ ActiveGate group
-    Files       : sql-east-01.yaml, sql-east-02.yaml
+  Fetching remote state ... 0 existing config(s) found
+  [dry-run → create] scope=ag_group-XXXXXXXXXXXXXXXX (2 endpoint(s))
 
 Tenant: tenant-nonprod  (https://def67890.live.dynatrace.com)
-  [DRY RUN] scope=ag_group-YYYYYYYYYYYYYYYY (2 endpoints)
-    Description : Non-production MSSQL — internal ActiveGate group
-    Files       : dev-sql-01.yaml, qa-sql-01.yaml
+  Fetching remote state ... 0 existing config(s) found
+  [dry-run → create] scope=ag_group-YYYYYYYYYYYYYYYY (2 endpoint(s))
 
-Dry run complete. 2 monitoring config(s) across 2 tenant(s) would be deployed.
+Dry run complete — no changes made.
 ```
 
 ---
@@ -151,13 +151,69 @@ Compiling tenant-prod ... 2 endpoint(s) across 1 AG group(s)
 Compiling tenant-nonprod ... 2 endpoint(s) across 1 AG group(s)
 
 Tenant: tenant-prod  (https://abc12345.live.dynatrace.com)
-  Deploying scope=ag_group-XXXXXXXXXXXXXXXX (2 endpoints) ... OK  (id: 12345678-abcd-...)
+  Fetching remote state ... 0 existing config(s) found
+  [create] scope=ag_group-XXXXXXXXXXXXXXXX (2 endpoint(s)) ... OK  (id: 12345678-abcd-...)
 
 Tenant: tenant-nonprod  (https://def67890.live.dynatrace.com)
-  Deploying scope=ag_group-YYYYYYYYYYYYYYYY (2 endpoints) ... OK  (id: 87654321-dcba-...)
+  Fetching remote state ... 0 existing config(s) found
+  [create] scope=ag_group-YYYYYYYYYYYYYYYY (2 endpoint(s)) ... OK  (id: 87654321-dcba-...)
 
-Done. 2 deployed, 0 failed.
+Done. 2 created, 0 unchanged.
 ```
+
+---
+
+## How reconciliation works
+
+Every run compares local files against what is currently deployed in Dynatrace before making any API calls:
+
+| Situation | Action |
+|---|---|
+| AG group folder exists locally, no matching config in DT | `POST` — create |
+| AG group folder exists locally, config in DT, endpoints changed | `PUT` — update |
+| AG group folder exists locally, config in DT, no changes | Skip — no API call |
+| Config exists in DT but no matching local folder | Warn (see below) |
+
+Change detection hashes the compiled endpoint list. Unchanged groups produce zero API calls — re-running on an unmodified repo is safe and cheap.
+
+### Adding a server
+
+Add a YAML file to the appropriate AG group folder and re-run. Only that group's config is touched; all others are skipped.
+
+### Removing a server
+
+Delete the YAML file and re-run. The group config is updated (PUT) with that endpoint removed.
+
+### Subsequent run output (mix of changes and no-ops)
+
+```
+Tenant: tenant-prod  (https://abc12345.live.dynatrace.com)
+  Fetching remote state ... 2 existing config(s) found
+  [skip  ] scope=ag_group-XXXXXXXXXXXXXXXX (2 endpoint(s))  (no changes)
+  [update] scope=ag_group-YYYYYYYYYYYYYYYY (3 endpoint(s)) ... OK
+
+Done. 1 updated, 1 unchanged.
+```
+
+---
+
+## Orphaned configs (in Dynatrace, not in local files)
+
+If a monitoring config exists in Dynatrace with no corresponding local folder, the script warns rather than silently deleting:
+
+```
+  [warn  ] No local folder for scope=ag_group-ZZZZZZZZZZZZZZZZ  id=abcd-1234  (old config)
+           Add a matching AG group folder to manage it, or re-run with --prune to delete it.
+```
+
+To delete orphaned configs explicitly:
+
+```bash
+python deploy_configs.py --prune --dry-run  # preview deletions first
+python deploy_configs.py --prune            # delete orphans + apply any other changes
+```
+
+`--prune` always requires an explicit flag — a missing folder never causes an automatic deletion.
 
 ---
 
@@ -178,7 +234,8 @@ python deploy_configs.py --list-ag-groups --tenant tenant-prod
 |---|---|
 | `--configs-dir` | Root configs directory (default: `configs/`) |
 | `--tenant` | Deploy only this tenant folder |
-| `--dry-run` | Compile and preview without deploying |
+| `--dry-run` | Compile, diff, and preview without deploying |
+| `--prune` | Delete configs in Dynatrace with no matching local folder |
 | `--list` | Print existing monitoring config IDs for the tenant(s) |
 | `--list-ag-groups` | Print AG groups and scope IDs for the tenant(s) |
 

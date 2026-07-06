@@ -11,17 +11,21 @@ Walks a three-level configs/ hierarchy:
         sql-server-01.yaml  ← one file per SQL Server endpoint
         sql-server-02.yaml
 
-For each tenant, resolves credentials from the environment variable named in
-_tenant.yaml, then deploys one monitoring configuration per AG group folder.
+Reconciles against existing Dynatrace state — only POSTs new configs,
+PUTs changed ones, and skips unchanged. Warns about configs in Dynatrace
+that have no corresponding local folder; use --prune to delete them.
 
 Usage:
     python deploy_configs.py
 
-    Dry run (compile and print without deploying):
+    Dry run (compile and diff without deploying):
         python deploy_configs.py --dry-run
 
     Single tenant only:
         python deploy_configs.py --tenant prod
+
+    Delete Dynatrace configs with no matching local folder:
+        python deploy_configs.py --prune
 
     List existing monitoring configurations for a tenant:
         python deploy_configs.py --list --tenant prod
@@ -35,6 +39,7 @@ Environment variables:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -56,14 +61,17 @@ GROUP_MANIFEST = "_group.yaml"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compile endpoint YAML files and deploy MSSQL monitoring configs to Dynatrace"
+        description="Reconcile and deploy MSSQL monitoring configs to Dynatrace"
     )
     parser.add_argument("--configs-dir", default="configs",
                         help="Root configs directory (default: configs/)")
     parser.add_argument("--tenant", default=None,
                         help="Deploy only this tenant folder (default: all tenants)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Compile and print grouped payloads without deploying")
+                        help="Compile, diff, and print planned actions without deploying")
+    parser.add_argument("--prune", action="store_true",
+                        help="Delete monitoring configs in Dynatrace that have no matching "
+                             "local folder (default: warn only)")
     parser.add_argument("--list", action="store_true",
                         help="List existing monitoring configurations for the tenant(s)")
     parser.add_argument("--list-ag-groups", action="store_true",
@@ -218,6 +226,32 @@ def discover_tenants(configs_dir: Path, tenant_filter: str = None) -> list[Path]
 
 
 # ---------------------------------------------------------------------------
+# Payload + hashing
+# ---------------------------------------------------------------------------
+
+def build_payload(scope: str, group_data: dict) -> dict:
+    return {
+        "scope": scope,
+        "description": group_data["description"],
+        "value": {
+            "enabled": True,
+            "description": group_data["description"],
+            "endpoints": group_data["endpoints"],
+        },
+    }
+
+
+def endpoint_hash(endpoints: list) -> str:
+    """Stable hash of an endpoint list for change detection."""
+    stable = json.dumps(
+        sorted(endpoints, key=lambda e: e.get("name", "")),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(stable.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
 
@@ -242,22 +276,39 @@ def api_request(method: str, url: str, api_token: str, payload: dict = None) -> 
         raise RuntimeError(f"HTTP {e.code} {method} {url}: {body}")
 
 
-def build_payload(scope: str, group_data: dict) -> dict:
-    return {
-        "scope": scope,
-        "description": group_data["description"],
-        "value": {
-            "enabled": True,
-            "description": group_data["description"],
-            "endpoints": group_data["endpoints"],
-        },
-    }
+def fetch_remote_state(env_url: str, api_token: str) -> dict:
+    """
+    Returns { scope: { "objectId": str, "endpoint_hash": str } } for all
+    existing monitoring configurations in this tenant.
+    """
+    url = f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations"
+    items = api_request("GET", url, api_token).get("items", [])
+
+    remote = {}
+    for item in items:
+        config_id = item.get("objectId", item.get("id"))
+        scope = item.get("scope", "environment")
+        try:
+            detail = api_request(
+                "GET",
+                f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations/{config_id}",
+                api_token,
+            )
+            endpoints = detail.get("value", {}).get("endpoints", [])
+            remote[scope] = {
+                "objectId": config_id,
+                "endpoint_hash": endpoint_hash(endpoints),
+                "description": detail.get("description", ""),
+            }
+        except RuntimeError as e:
+            print(f"  WARNING: could not fetch detail for config {config_id}: {e}", file=sys.stderr)
+
+    return remote
 
 
 def list_configs(env_url: str, api_token: str):
     url = f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations"
-    result = api_request("GET", url, api_token)
-    items = result.get("items", [])
+    items = api_request("GET", url, api_token).get("items", [])
     if not items:
         print("  No monitoring configurations found.")
         return
@@ -295,7 +346,6 @@ def list_ag_groups(env_url: str, api_token: str):
     print("  " + "-" * 76)
     for name, ids in sorted(seen.items()):
         print(f"  {name:<40} {', '.join(ids[:3])}{'...' if len(ids) > 3 else ''}")
-    print()
     print("  Tip: get ag_group-XXXX scope IDs from Settings → ActiveGates → Groups in the UI.")
 
 
@@ -317,7 +367,6 @@ def main():
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # --list / --list-ag-groups: just need tenant manifests, not full compile
     if args.list or args.list_ag_groups:
         for tenant_dir in tenant_dirs:
             print(f"\nTenant: {tenant_dir.name}")
@@ -335,7 +384,7 @@ def main():
                 print(f"  ERROR: {e}", file=sys.stderr)
         return
 
-    # Compile all tenants first so errors surface before any deploy
+    # Compile all tenants first so errors surface before any API calls
     compiled = {}
     compile_errors = []
     for tenant_dir in tenant_dirs:
@@ -346,7 +395,7 @@ def main():
             total_groups = len(compiled[tenant_dir.name]["groups"])
             print(f"{total_endpoints} endpoint(s) across {total_groups} AG group(s)")
         except RuntimeError as e:
-            print(f"FAILED")
+            print("FAILED")
             print(f"  ERROR: {e}", file=sys.stderr)
             compile_errors.append(tenant_dir.name)
 
@@ -356,48 +405,130 @@ def main():
 
     print()
 
-    total_deployed = 0
+    total_created = 0
+    total_updated = 0
+    total_skipped = 0
+    total_pruned = 0
     total_failed = 0
 
     for tenant_name, tenant_data in compiled.items():
         env_url = tenant_data["env_url"]
         api_token = tenant_data["api_token"]
+        local_groups = tenant_data["groups"]
 
         print(f"Tenant: {tenant_name}  ({env_url})")
 
-        for scope, group_data in tenant_data["groups"].items():
+        # Fetch current state from Dynatrace
+        print(f"  Fetching remote state ...", end=" ", flush=True)
+        try:
+            remote = fetch_remote_state(env_url, api_token)
+            print(f"{len(remote)} existing config(s) found")
+        except RuntimeError as e:
+            print(f"FAILED — {e}", file=sys.stderr)
+            total_failed += len(local_groups)
+            print()
+            continue
+
+        # --- Reconcile local → remote ---
+        for scope, group_data in local_groups.items():
+            payload = build_payload(scope, group_data)
+            local_hash = endpoint_hash(group_data["endpoints"])
             endpoint_count = len(group_data["endpoints"])
-            label = f"  scope={scope} ({endpoint_count} endpoints)"
+            label = f"scope={scope} ({endpoint_count} endpoint(s))"
+
+            if scope not in remote:
+                # New — POST
+                action = "create"
+                action_label = f"  [create] {label}"
+            elif remote[scope]["endpoint_hash"] == local_hash:
+                # Unchanged — skip
+                print(f"  [skip  ] {label}  (no changes)")
+                total_skipped += 1
+                continue
+            else:
+                # Changed — PUT
+                action = "update"
+                action_label = f"  [update] {label}"
 
             if args.dry_run:
-                print(f"  [DRY RUN] {label}")
-                print(f"    Description : {group_data['description']}")
-                print(f"    Files       : {', '.join(group_data['source_files'])}")
+                print(f"  [dry-run → {action}] {label}")
                 continue
 
-            print(f"  Deploying {label} ... ", end="", flush=True)
+            print(f"{action_label} ... ", end="", flush=True)
             try:
-                result = api_request(
-                    "POST",
-                    f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations",
-                    api_token,
-                    build_payload(scope, group_data),
-                )
-                config_id = result.get("objectId", result.get("id", "unknown"))
-                print(f"OK  (id: {config_id})")
-                total_deployed += 1
+                if action == "create":
+                    result = api_request(
+                        "POST",
+                        f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations",
+                        api_token,
+                        payload,
+                    )
+                    config_id = result.get("objectId", result.get("id", "unknown"))
+                    print(f"OK  (id: {config_id})")
+                    total_created += 1
+                else:
+                    object_id = remote[scope]["objectId"]
+                    api_request(
+                        "PUT",
+                        f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations/{object_id}",
+                        api_token,
+                        payload,
+                    )
+                    print("OK")
+                    total_updated += 1
             except RuntimeError as e:
                 print("FAILED")
                 print(f"    {e}", file=sys.stderr)
                 total_failed += 1
 
+        # --- Orphaned remote configs (exist in DT, not in local) ---
+        orphaned = {s: v for s, v in remote.items() if s not in local_groups}
+        for scope, remote_data in orphaned.items():
+            object_id = remote_data["objectId"]
+            desc = remote_data.get("description", "")
+            label = f"scope={scope}  id={object_id}"
+            if desc:
+                label += f"  ({desc})"
+
+            if args.prune:
+                if args.dry_run:
+                    print(f"  [dry-run → delete] {label}")
+                    continue
+                print(f"  [delete] {label} ... ", end="", flush=True)
+                try:
+                    api_request(
+                        "DELETE",
+                        f"{env_url}/api/v2/extensions/{EXTENSION_NAME}/monitoringConfigurations/{object_id}",
+                        api_token,
+                    )
+                    print("OK")
+                    total_pruned += 1
+                except RuntimeError as e:
+                    print("FAILED")
+                    print(f"    {e}", file=sys.stderr)
+                    total_failed += 1
+            else:
+                print(f"  [warn  ] No local folder for {label}")
+                print(f"           Add a matching AG group folder to manage it, or re-run with --prune to delete it.")
+
         print()
 
+    # Summary
     if args.dry_run:
-        total_groups = sum(len(t["groups"]) for t in compiled.values())
-        print(f"Dry run complete. {total_groups} monitoring config(s) across {len(compiled)} tenant(s) would be deployed.")
+        print("Dry run complete — no changes made.")
     else:
-        print(f"Done. {total_deployed} deployed, {total_failed} failed.")
+        parts = []
+        if total_created:
+            parts.append(f"{total_created} created")
+        if total_updated:
+            parts.append(f"{total_updated} updated")
+        if total_skipped:
+            parts.append(f"{total_skipped} unchanged")
+        if total_pruned:
+            parts.append(f"{total_pruned} deleted")
+        if total_failed:
+            parts.append(f"{total_failed} failed")
+        print("Done. " + ", ".join(parts) + ".")
 
     if total_failed:
         sys.exit(1)
