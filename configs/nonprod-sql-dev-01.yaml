@@ -1,0 +1,11 @@
+name: nonprod-sql-dev-01
+enabled: true
+connection_string: "Server=dev-sql-01.corp.example.com;Port=1433;Database=master;"
+credential_id: "CREDENTIALS_VAULT-<YOUR_NONPROD_CREDENTIAL_ID>"
+
+# Different ag_group = compiled into a separate monitoring configuration
+ag_group: "ag_group-YYYYYYYYYYYYYYYY"
+group_description: "Non-production MSSQL — managed by dt-mssql-iac-utils"
+
+sql_server_logs_enabled: false
+queries: []

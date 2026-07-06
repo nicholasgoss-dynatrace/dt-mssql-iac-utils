@@ -1,65 +1,86 @@
 # How to deploy MSSQL monitoring configurations
 
-`deploy_configs.py` reads JSON files from the `configs/` directory and deploys each one as a monitoring configuration for the `com.dynatrace.extension.sql-server` extension. The `configs/` folder is your config-as-code store — it is safe to commit to Git.
+`deploy_configs.py` reads individual endpoint YAML files from the `configs/` directory,
+groups them by their `ag_group` field, and deploys one monitoring configuration per unique
+group to the `com.dynatrace.extension.sql-server` extension.
+
+**Each YAML file is the IaC record for one SQL Server endpoint.** The script handles batching — you never hand-edit a payload. Adding a server = adding a file. Removing a server = deleting a file. Git diffs are always one endpoint.
 
 ## Prerequisites
 
 - Python 3.7+
+- PyYAML: `pip install -r requirements.txt`
 - A Dynatrace API token with `extensions.write` and `credentialVault.read` scopes
 - The MSSQL extension (`com.dynatrace.extension.sql-server`) installed in your environment
 - At least one credential created via `create_credential.py` (see [how-to-create-credentials.md](how-to-create-credentials.md))
 
-## Step 1 — Create your config files
+## How it works
 
-Config files live in `configs/`. Each file maps to one monitoring configuration in Dynatrace. You can have as many files as you like; each supports up to 20,000 endpoints.
+```
+configs/
+  prod-sql-east-01.yaml  ┐
+  prod-sql-east-02.yaml  ├─ ag_group: ag_group-XXXX  →  POST one monitoring config
+  prod-sql-east-03.yaml  ┘
+  nonprod-sql-dev-01.yaml ┐
+  nonprod-sql-qa-01.yaml  ├─ ag_group: ag_group-YYYY  →  POST one monitoring config
+  nonprod-sql-qa-02.yaml  ┘
+```
 
-Copy and modify the example:
+Files that share the same `ag_group` value are compiled into one monitoring configuration batch. The script creates exactly as many monitoring configs as there are distinct `ag_group` values across your files.
+
+## Step 1 — Find your ActiveGate group ID
 
 ```bash
-cp configs/example-prod-cluster.json configs/prod-east.json
+python deploy_configs.py --list-ag-groups
 ```
 
-Edit `configs/prod-east.json`:
+Output:
 
-```json
-{
-  "scope": "environment",
-  "description": "Production East MSSQL - managed by dt-mssql-iac-utils",
-  "value": {
-    "enabled": true,
-    "description": "Production East endpoints",
-    "endpoints": [
-      {
-        "name": "sql-east-01",
-        "enabled": true,
-        "connectionString": "Server=sql-east-01.corp.example.com;Port=1433;Database=master;",
-        "authentication": {
-          "scheme": "sqlAuth",
-          "credentials": "CREDENTIALS_VAULT-ABC123DEF456"
-        },
-        "sqlServerLogsEnabled": false,
-        "queries": []
-      }
-    ]
-  }
-}
+```
+Scope ID (use as ag_group in endpoint files)     Group Name
+--------------------------------------------------------------------------------
+ag_group-XXXXXXXXXXXXXXXX                        prod-dmz-ag-group
+ag_group-YYYYYYYYYYYYYYYY                        nonprod-ag-group
 ```
 
-Key fields:
+If the API doesn't expose a dedicated groups endpoint, find IDs in the Dynatrace UI under **Settings → ActiveGates → Groups**.
 
-| Field | Description |
-|---|---|
-| `scope` | Always `"environment"` for environment-level configs |
-| `description` | Human-readable label shown in the Dynatrace UI |
-| `endpoints[].name` | Display name for this SQL Server instance |
-| `endpoints[].connectionString` | JDBC-style connection string — no credentials |
-| `endpoints[].authentication.credentials` | Credential Vault ID from `create_credential.py` |
-| `endpoints[].sqlServerLogsEnabled` | Set `true` to enable SQL Server log ingestion |
-| `endpoints[].queries` | Optional array of custom SQL queries to execute |
+Use `"environment"` as the `ag_group` value if you don't need to pin to a specific group.
 
-## Step 2 — Validate (dry run)
+## Step 2 — Create endpoint files
 
-Before sending anything to the API, validate your files:
+One file per SQL Server instance. Copy an example and fill in your values:
+
+```bash
+cp configs/prod-sql-east-01.yaml configs/prod-sql-myserver.yaml
+```
+
+Minimum required fields:
+
+```yaml
+name: prod-sql-myserver
+connection_string: "Server=myserver.corp.example.com;Port=1433;Database=master;"
+credential_id: "CREDENTIALS_VAULT-ABC123DEF456"
+ag_group: "ag_group-XXXXXXXXXXXXXXXX"
+```
+
+Full field reference:
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `name` | Yes | — | Display name in Dynatrace |
+| `connection_string` | Yes | — | JDBC-style connection string, no credentials |
+| `credential_id` | Yes | — | Credential Vault ID from `create_credential.py` |
+| `ag_group` | Yes | — | AG group scope — groups files into one monitoring config |
+| `enabled` | No | `true` | Enable/disable this endpoint |
+| `sql_server_logs_enabled` | No | `false` | Enable SQL Server log ingestion |
+| `auth_scheme` | No | `sqlAuth` | Authentication scheme |
+| `queries` | No | `[]` | Custom SQL queries to execute |
+| `group_description` | No | auto | Description set on the monitoring config for this AG group |
+
+## Step 3 — Dry run
+
+Validate and preview what would be deployed without making any API calls:
 
 ```bash
 python deploy_configs.py --dry-run
@@ -68,14 +89,20 @@ python deploy_configs.py --dry-run
 Output:
 
 ```
-[DRY RUN] POST https://abc123.live.dynatrace.com/api/v2/extensions/com.dynatrace.extension.sql-server/monitoringConfigurations
-  File   : configs/prod-east.json
-  Endpoints: 3
+Compiled 4 endpoint(s) into 2 monitoring configuration(s):
 
-Dry run complete. 2 file(s) validated.
+[DRY RUN] scope: ag_group-XXXXXXXXXXXXXXXX
+  Endpoints : 2 (prod-sql-east-01.yaml, prod-sql-east-02.yaml)
+  Description: Production East MSSQL — managed by dt-mssql-iac-utils
+
+[DRY RUN] scope: ag_group-YYYYYYYYYYYYYYYY
+  Endpoints : 2 (nonprod-sql-dev-01.yaml, nonprod-sql-qa-01.yaml)
+  Description: Non-production MSSQL — managed by dt-mssql-iac-utils
+
+Dry run complete. 2 monitoring config(s) would be deployed.
 ```
 
-## Step 3 — Deploy
+## Step 4 — Deploy
 
 ```bash
 source .env
@@ -85,113 +112,18 @@ python deploy_configs.py
 Output:
 
 ```
-Deploying configs/prod-east.json ... OK  (id: 12345678-abcd-...)
-Deploying configs/prod-west.json ... OK  (id: 87654321-dcba-...)
+Compiled 4 endpoint(s) into 2 monitoring configuration(s):
+
+Deploying scope=ag_group-XXXXXXXXXXXXXXXX (2 endpoints) ... OK  (id: 12345678-abcd-...)
+Deploying scope=ag_group-YYYYYYYYYYYYYYYY (2 endpoints) ... OK  (id: 87654321-dcba-...)
 
 Done. 2 deployed, 0 failed.
 ```
 
-## Step 4 — Verify in the Dynatrace UI
-
-1. Go to **Settings → Monitored technologies → Microsoft SQL Server**
-2. Confirm your configurations appear with the descriptions you set
-3. Check **Data explorer** or the MSSQL built-in dashboard after a few minutes to confirm metrics are flowing
-
-## Updating an existing configuration
-
-To replace a specific configuration (e.g. to add endpoints):
+## Viewing existing configurations
 
 ```bash
-# Get the current config IDs
 python deploy_configs.py --list
-
-# Update by ID
-python deploy_configs.py \
-    --update 12345678-abcd-efgh-ijkl-000000000000 \
-    --config-file configs/prod-east.json
-```
-
-`--update` sends a `PUT` instead of `POST`, replacing the full configuration.
-
-## Folder structure as a pattern
-
-```
-configs/
-  prod-east.json         ← Production East cluster (50 endpoints)
-  prod-west.json         ← Production West cluster (50 endpoints)
-  nonprod.json           ← Dev + QA (20 endpoints)
-  legacy-on-prem.json    ← Standalone instances, different credential
-```
-
-Each file is independent. Different files can reference different credentials — useful if different environments use different SQL service accounts.
-
-## Targeting a specific ActiveGate group
-
-By default, `"scope": "environment"` means any available ActiveGate can run the extension. To pin monitoring to a specific ActiveGate group (e.g. a DMZ group for on-prem servers):
-
-### Step 1 — Find the ActiveGate group ID
-
-```bash
-python deploy_configs.py --list-ag-groups
-```
-
-Output:
-
-```
-Scope ID (use with --scope)                   Group Name
---------------------------------------------------------------------------------
-ag_group-XXXXXXXXXXXXXXXX                     prod-dmz-ag-group
-ag_group-YYYYYYYYYYYYYYYY                     nonprod-ag-group
-```
-
-If the API doesn't expose a dedicated groups endpoint, the script will guide you to find the IDs in the Dynatrace UI under **Settings → ActiveGates → Groups**.
-
-### Step 2a — Set scope per config file
-
-Edit the `scope` field directly in your JSON file to pin that configuration permanently:
-
-```json
-{
-  "scope": "ag_group-XXXXXXXXXXXXXXXX",
-  "description": "Prod East MSSQL — routed through DMZ ActiveGate group",
-  ...
-}
-```
-
-Use this approach when different config files need different AG groups.
-
-### Step 2b — Override scope at deploy time
-
-Use `--scope` to override the scope for all files in a single run — useful in pipelines where the target group varies by environment:
-
-```bash
-python deploy_configs.py --scope ag_group-XXXXXXXXXXXXXXXX
-```
-
-Or set it via env var:
-
-```bash
-export DT_AG_SCOPE=ag_group-XXXXXXXXXXXXXXXX
-python deploy_configs.py
-```
-
-`--scope` always wins over whatever is in the JSON file, so the same `configs/` folder can be reused across environments with no file edits.
-
-### Dry run with scope override
-
-```bash
-python deploy_configs.py --scope ag_group-XXXXXXXXXXXXXXXX --dry-run
-```
-
-Output:
-
-```
-Scope override: ag_group-XXXXXXXXXXXXXXXX
-
-[DRY RUN] POST https://abc123.live.dynatrace.com/api/v2/extensions/com.dynatrace.extension.sql-server/monitoringConfigurations
-  File     : configs/prod-east.json
-  Scope    : ag_group-XXXXXXXXXXXXXXXX
-  Endpoints: 3
 ```
 
 ## Options reference
@@ -200,26 +132,34 @@ Scope override: ag_group-XXXXXXXXXXXXXXXX
 |---|---|---|
 | `--env-url` | `DT_ENV_URL` | Dynatrace environment URL |
 | `--api-token` | `DT_API_TOKEN` | API token |
-| `--configs-dir` | — | Path to configs folder (default: `configs/`) |
-| `--config-file` | — | Deploy a single file |
-| `--scope` | `DT_AG_SCOPE` | Override scope (e.g. `ag_group-XXXX` or `environment`) |
-| `--update <id>` | — | PUT to an existing config ID (requires `--config-file`) |
-| `--dry-run` | — | Validate files without making API calls |
+| `--configs-dir` | — | Path to endpoint files folder (default: `configs/`) |
+| `--dry-run` | — | Compile and preview without deploying |
 | `--list` | — | Print existing monitoring config IDs and exit |
-| `--list-ag-groups` | — | Print ActiveGate groups and scope IDs, then exit |
+| `--list-ag-groups` | — | Print AG groups and scope IDs, then exit |
 
 ## CI/CD integration
 
-The scripts are self-contained Python with no dependencies. To integrate into a pipeline:
-
 ```yaml
 # Example GitHub Actions step
+- name: Install dependencies
+  run: pip install -r requirements.txt
+
 - name: Deploy MSSQL configs
   env:
     DT_ENV_URL: ${{ secrets.DT_ENV_URL }}
     DT_API_TOKEN: ${{ secrets.DT_API_TOKEN }}
-    DT_AG_SCOPE: ${{ secrets.DT_AG_SCOPE }}   # optional: pin to an AG group
   run: python deploy_configs.py
 ```
 
-Store `DT_ENV_URL`, `DT_API_TOKEN`, and `DT_AG_SCOPE` as pipeline secrets — never in the repo.
+Store `DT_ENV_URL` and `DT_API_TOKEN` as pipeline secrets. The `configs/` folder (endpoint YAML files) is safe to commit — it contains connection strings and credential IDs, but no secrets.
+
+## File naming convention
+
+File names have no functional meaning — only the `ag_group` field controls grouping. That said, a consistent naming pattern makes the folder scannable:
+
+```
+{env}-{role}-{region}-{sequence}.yaml
+prod-sql-east-01.yaml
+nonprod-sql-qa-01.yaml
+legacy-sql-onprem-01.yaml
+```

@@ -1,0 +1,7 @@
+name: nonprod-sql-qa-01
+enabled: true
+connection_string: "Server=qa-sql-01.corp.example.com;Port=1433;Database=master;"
+credential_id: "CREDENTIALS_VAULT-<YOUR_NONPROD_CREDENTIAL_ID>"
+ag_group: "ag_group-YYYYYYYYYYYYYYYY"
+sql_server_logs_enabled: false
+queries: []
