@@ -1,0 +1,32 @@
+{
+  "scope": "environment",
+  "description": "Production MSSQL cluster - managed by dt-mssql-iac-utils",
+  "value": {
+    "enabled": true,
+    "description": "Production MSSQL endpoints",
+    "endpoints": [
+      {
+        "name": "prod-sql-01",
+        "enabled": true,
+        "connectionString": "Server=prod-sql-01.internal;Port=1433;Database=master;",
+        "authentication": {
+          "scheme": "sqlAuth",
+          "credentials": "CREDENTIALS_VAULT-<YOUR_CREDENTIAL_ID>"
+        },
+        "sqlServerLogsEnabled": false,
+        "queries": []
+      },
+      {
+        "name": "prod-sql-02",
+        "enabled": true,
+        "connectionString": "Server=prod-sql-02.internal;Port=1433;Database=master;",
+        "authentication": {
+          "scheme": "sqlAuth",
+          "credentials": "CREDENTIALS_VAULT-<YOUR_CREDENTIAL_ID>"
+        },
+        "sqlServerLogsEnabled": false,
+        "queries": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "scope": "environment",
+  "description": "Non-production MSSQL cluster - managed by dt-mssql-iac-utils",
+  "value": {
+    "enabled": true,
+    "description": "Non-prod MSSQL endpoints",
+    "endpoints": [
+      {
+        "name": "dev-sql-01",
+        "enabled": true,
+        "connectionString": "Server=dev-sql-01.internal;Port=1433;Database=master;",
+        "authentication": {
+          "scheme": "sqlAuth",
+          "credentials": "CREDENTIALS_VAULT-<YOUR_CREDENTIAL_ID>"
+        },
+        "sqlServerLogsEnabled": false,
+        "queries": []
+      },
+      {
+        "name": "qa-sql-01",
+        "enabled": true,
+        "connectionString": "Server=qa-sql-01.internal;Port=1433;Database=master;",
+        "authentication": {
+          "scheme": "sqlAuth",
+          "credentials": "CREDENTIALS_VAULT-<YOUR_CREDENTIAL_ID>"
+        },
+        "sqlServerLogsEnabled": false,
+        "queries": []
+      }
+    ]
+  }
+}
